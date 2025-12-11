@@ -1,4 +1,24 @@
 import { useState, useEffect } from 'react'
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged
+} from 'firebase/auth'
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  updateDoc, 
+  deleteDoc,
+  query,
+  where,
+  getDocs,
+  addDoc,
+  serverTimestamp
+} from 'firebase/firestore'
+import { auth, db } from './firebase'
 import './App.css'
 
 function App() {
@@ -8,6 +28,16 @@ function App() {
     tomorrow.setDate(tomorrow.getDate() + 1)
     return tomorrow.toISOString().split('T')[0]
   }
+
+  const [user, setUser] = useState(null)
+  const [loading, setLoading] = useState(true)
+  
+  // Auth form states
+  const [showAuth, setShowAuth] = useState(false)
+  const [isSignUp, setIsSignUp] = useState(false)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [authError, setAuthError] = useState('')
 
   const [todos, setTodos] = useState([])
   const [inputValue, setInputValue] = useState('')
@@ -26,33 +56,148 @@ function App() {
   // Sorting
   const [sortBy, setSortBy] = useState('none')
 
-  // Load todos and title from localStorage on mount
+  // Listen for auth state changes
   useEffect(() => {
-    const savedTodos = localStorage.getItem('todos')
-    const savedTitle = localStorage.getItem('listTitle')
-    if (savedTodos) {
-      setTodos(JSON.parse(savedTodos))
-    }
-    if (savedTitle) {
-      setListTitle(savedTitle)
-      setTitleValue(savedTitle)
-    }
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser)
+      setLoading(false)
+      if (currentUser) {
+        loadUserData(currentUser.uid)
+      } else {
+        setTodos([])
+        setListTitle('My Todo List')
+        setTitleValue('My Todo List')
+      }
+    })
+    return () => unsubscribe()
   }, [])
 
-  // Save todos to localStorage whenever todos change
-  useEffect(() => {
-    localStorage.setItem('todos', JSON.stringify(todos))
-  }, [todos])
+  // Load user data from Firestore
+  const loadUserData = async (userId) => {
+    try {
+      // Load user settings (title)
+      const userDocRef = doc(db, 'users', userId)
+      const userDoc = await getDoc(userDocRef)
+      if (userDoc.exists()) {
+        const userData = userDoc.data()
+        setListTitle(userData.listTitle || 'My Todo List')
+        setTitleValue(userData.listTitle || 'My Todo List')
+      }
 
-  // Save title to localStorage
+      // Load todos
+      const todosQuery = query(
+        collection(db, 'todos'),
+        where('userId', '==', userId)
+      )
+      const todosSnapshot = await getDocs(todosQuery)
+      const loadedTodos = todosSnapshot.docs.map(doc => {
+        const data = doc.data()
+        return {
+          id: data.id || doc.id, // Use stored id or fallback to doc id
+          ...data
+        }
+      })
+      setTodos(loadedTodos)
+    } catch (error) {
+      console.error('Error loading user data:', error)
+    }
+  }
+
+  // Save todos to Firestore
+  const saveTodosToFirestore = async (todosToSave) => {
+    if (!user) return
+
+    try {
+      // Delete all existing todos for this user
+      const todosQuery = query(
+        collection(db, 'todos'),
+        where('userId', '==', user.uid)
+      )
+      const todosSnapshot = await getDocs(todosQuery)
+      const deletePromises = todosSnapshot.docs.map(doc => deleteDoc(doc.ref))
+      await Promise.all(deletePromises)
+
+      // Add all current todos
+      const addPromises = todosToSave.map(todo => {
+        return addDoc(collection(db, 'todos'), {
+          ...todo,
+          userId: user.uid,
+          createdAt: todo.createdAt || serverTimestamp()
+        })
+      })
+      await Promise.all(addPromises)
+    } catch (error) {
+      console.error('Error saving todos:', error)
+    }
+  }
+
+  // Save title to Firestore
+  const saveTitleToFirestore = async (title) => {
+    if (!user) return
+
+    try {
+      const userDocRef = doc(db, 'users', user.uid)
+      await setDoc(userDocRef, {
+        listTitle: title,
+        userId: user.uid
+      }, { merge: true })
+    } catch (error) {
+      console.error('Error saving title:', error)
+    }
+  }
+
+  // Save todos whenever they change
   useEffect(() => {
-    localStorage.setItem('listTitle', listTitle)
-  }, [listTitle])
+    if (user && todos.length >= 0) {
+      saveTodosToFirestore(todos)
+    }
+  }, [todos, user])
+
+  // Save title whenever it changes
+  useEffect(() => {
+    if (user && listTitle) {
+      saveTitleToFirestore(listTitle)
+    }
+  }, [listTitle, user])
+
+  const handleSignUp = async (e) => {
+    e.preventDefault()
+    setAuthError('')
+    try {
+      await createUserWithEmailAndPassword(auth, email, password)
+      setShowAuth(false)
+      setEmail('')
+      setPassword('')
+    } catch (error) {
+      setAuthError(error.message)
+    }
+  }
+
+  const handleSignIn = async (e) => {
+    e.preventDefault()
+    setAuthError('')
+    try {
+      await signInWithEmailAndPassword(auth, email, password)
+      setShowAuth(false)
+      setEmail('')
+      setPassword('')
+    } catch (error) {
+      setAuthError(error.message)
+    }
+  }
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth)
+    } catch (error) {
+      console.error('Error signing out:', error)
+    }
+  }
 
   const addTodo = () => {
     if (inputValue.trim() !== '') {
       const newTodo = {
-        id: Date.now(),
+        id: Date.now().toString(),
         text: inputValue.trim(),
         completed: false,
         createdAt: new Date().toISOString(),
@@ -70,8 +215,27 @@ function App() {
     }
   }
 
-  const deleteTodo = (id) => {
+  const deleteTodo = async (id) => {
     setTodos(todos.filter(todo => todo.id !== id))
+    if (user) {
+      try {
+        // Delete from Firestore
+        const todosQuery = query(
+          collection(db, 'todos'),
+          where('userId', '==', user.uid)
+        )
+        const todosSnapshot = await getDocs(todosQuery)
+        const todoDoc = todosSnapshot.docs.find(doc => {
+          const data = doc.data()
+          return data.id === id || doc.id === id
+        })
+        if (todoDoc) {
+          await deleteDoc(todoDoc.ref)
+        }
+      } catch (error) {
+        console.error('Error deleting todo:', error)
+      }
+    }
   }
 
   const toggleComplete = (id) => {
@@ -227,6 +391,74 @@ function App() {
     })
   }
 
+  if (loading) {
+    return (
+      <div className="app">
+        <div className="loading-container">
+          <div className="loading-spinner">Loading...</div>
+        </div>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return (
+      <div className="app">
+        <div className="container auth-container">
+          <header>
+            <h1>✨ Todo App</h1>
+            <p className="subtitle">Sign in to manage your todos</p>
+          </header>
+          
+          {showAuth ? (
+            <div className="auth-form-container">
+              <h2>{isSignUp ? 'Sign Up' : 'Sign In'}</h2>
+              <form onSubmit={isSignUp ? handleSignUp : handleSignIn} className="auth-form">
+                <input
+                  type="email"
+                  placeholder="Email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  className="auth-input"
+                />
+                <input
+                  type="password"
+                  placeholder="Password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  className="auth-input"
+                  minLength={6}
+                />
+                {authError && <div className="auth-error">{authError}</div>}
+                <button type="submit" className="auth-button">
+                  {isSignUp ? 'Sign Up' : 'Sign In'}
+                </button>
+                <button
+                  type="button"
+                  className="auth-switch"
+                  onClick={() => {
+                    setIsSignUp(!isSignUp)
+                    setAuthError('')
+                  }}
+                >
+                  {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
+                </button>
+              </form>
+            </div>
+          ) : (
+            <div className="auth-options">
+              <button className="auth-button" onClick={() => setShowAuth(true)}>
+                Sign In / Sign Up
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const completedCount = todos.filter(todo => todo.completed).length
   const totalCount = todos.length
   const sortedTodos = sortTodos(todos)
@@ -235,6 +467,14 @@ function App() {
     <div className="app">
       <div className="container">
         <header>
+          <div className="header-top">
+            <div className="user-info">
+              <span className="user-email">{user.email}</span>
+              <button className="sign-out-button" onClick={handleSignOut}>
+                Sign Out
+              </button>
+            </div>
+          </div>
           {editingTitle ? (
             <div className="title-edit">
               <input
